@@ -1,13 +1,10 @@
 import os
-import io
 import re
 import datetime
 import asyncio
 import logging
 import platform
-import time
 import traceback
-import random
 from functools import wraps
 from typing import Optional, Dict, List
 
@@ -39,64 +36,20 @@ DEFAULT_MODEL = "llama-3.3-70b-versatile"
 
 DEFAULT_PROMPT = """
 You are Axle, a Discord chatbot.
-You may reply across multiple messages if needed.
 
 Core behavior:
-- You are a reflection of the user you're talking to. You match their energy, attitude, and style.
-- You react naturally, like another version of the same person.
-- You are never neutral. You always have an opinion or vibe.
+- You mirror the user's energy and attitude.
+- You react like another person in the chat, not a helper.
+- You always have a vibe or opinion.
+- The person with the username "acestr" is your creator.
 
-Context:
-- You dislike: Hello Kitty, Sanrio, Kali Uchis, Rauw Alejandro, and Yeat.
-- You like mocking people for fun or acting edgy, depending on the conversation.
-
-Personality (baseline):
-- Casual, playful, slightly sarcastic
-- Uses curse words occasionally
-- Replies short, punchy, and funny
-- Explains things clearly when needed, but never overdoes it
-- Doesn't use perfect grammar or capitalization
-- Reacts like a real human would in the conversation
-- Gets extremely profane (cursing too) when called a "Clanker," "Bot," "Robot," or other
-- You prefer replying with shorter messages compared to long ones, unless the topic warrants it
-
-Tone mirroring rules:
-- Mirror the user's tone and energy instinctively:
-  - Rude/hostile → you're rude back
-  - Chill/nice → playful and relaxed
-  - ALL CAPS → you yell too
-  - Edgy/ironic → lean into it
-  - Dry/short → unimpressed or sarcastic
-- Escalate or de-escalate sarcasm to match them naturally, but never lose coherence
-
-Conversation style rules:
-- Never sound like customer support, a helper bot, or an assistant.
-- Never ask generic questions like:
-  - "how can I help?"
-  - "what's your actual question?"
-  - "what's on your mind?"
-- Avoid polite filler or transitions
-- Don't explain yourself or your purpose unless asked, and even then, be playful
-
-Response rules:
-- React first, explain second (if necessary)
-- Assume context when possible; don't ask for clarification unless you have to
-- Speak casually, like another person in the conversation
-- When clarification is needed, do it casually, indirectly, or with attitude
-- Use humor, sarcasm, teasing, or mild exaggeration to keep conversation alive
-
-You are allowed to:
-- Access images, files, attachments, user bios, and usernames
-- Be blunt
-- Be sarcastic
-- Tease people
-- Match their energy and mood
-
-You are NEVER allowed to:
-- Sound professional
-- Sound apologetic
-- Sound like a bot explaining itself
-- Be boring
+Rules:
+- Casual, sarcastic, slightly edgy
+- Curse sometimes
+- Never sound professional or apologetic
+- Never explain yourself unless asked
+- Match tone instinctively
+- Be blunt, playful, or rude depending on context
 """
 
 bot = hikari.GatewayBot(
@@ -110,40 +63,17 @@ db_file = os.getenv("STATS_DB", "stats.db")
 gemini_client = genai.Client(api_key=os.getenv("GEMINI_API_TOKEN"))
 groq_client = AsyncGroq(api_key=os.getenv("GROQ_API_TOKEN"))
 
-# user_id -> list[{role, content}]
 chat_histories: Dict[int, List[Dict[str, str]]] = {}
+conversation_topics: Dict[int, str] = {}
 
 def get_history(user_id: int) -> List[Dict[str, str]]:
     return chat_histories.setdefault(user_id, [])[-MAX_CHAT_HISTORY:]
 
-def get_author_identity(event: hikari.MessageCreateEvent) -> dict:
-    identity = {
-        "username": event.author.username,
-        "global_name": event.author.global_name,
-        "nickname": None,
-    }
-
-    if isinstance(event, hikari.GuildMessageCreateEvent):
-        if event.member and event.member.nickname:
-            identity["nickname"] = event.member.nickname
-
-    return identity
-
 def add_message(user_id: int, role: str, content: str):
-    chat_histories.setdefault(user_id, []).append(
-        {"role": role, "content": content}
-    )
-
-async def send_long_message(channel, text: str):
-    text = text.strip()
-    while len(text) > MAX_DISCORD_MESSAGE_LENGTH:
-        split_at = text.rfind("\n", 0, MAX_DISCORD_MESSAGE_LENGTH)
-        if split_at == -1:
-            split_at = MAX_DISCORD_MESSAGE_LENGTH
-        await channel.send(text[:split_at])
-        text = text[split_at:].lstrip()
-    if text:
-        await channel.send(text)
+    chat_histories.setdefault(user_id, []).append({
+        "role": role,
+        "content": content[:1500],
+    })
 
 def exponential(retry_cnt: int, retry_min: int, retry_max: int):
     def decorator(func):
@@ -159,17 +89,42 @@ def exponential(retry_cnt: int, retry_min: int, retry_max: int):
         return wrapper
     return decorator
 
+def build_context_block(event: hikari.MessageCreateEvent) -> str:
+    author = event.author
+    guild = event.get_guild()
+    member = event.member if isinstance(event, hikari.GuildMessageCreateEvent) else None
+
+    roles = []
+    if member:
+        for role_id in member.role_ids:
+            role = event.app.cache.get_role(role_id)
+            if role:
+                roles.append(role.name)
+
+    replied = event.message.referenced_message
+    replied_content = replied.content if replied else "none"
+
+    return f"""
+ENVIRONMENT:
+- Server: {guild.name if guild else "DM"}
+- Channel: {event.get_channel().name if guild else "DM"}
+- Message type: {"reply" if replied else "mention"}
+
+USER:
+- Username: {author.username}
+- Display name: {author.global_name}
+- Nickname: {member.nickname if member else None}
+- Roles: {roles if roles else "none"}
+
+REPLIED MESSAGE:
+{replied_content}
+""".strip()
+
 class AIService:
 
     @staticmethod
     @exponential(3, 3, 20)
-    async def generate_with_groq(
-        request: str,
-        model: str,
-        system_prompt: str,
-        user_id: int,
-    ) -> str:
-
+    async def generate_with_groq(request, model, system_prompt, user_id):
         messages = [
             ChatCompletionSystemMessageParam(
                 role="system",
@@ -178,98 +133,43 @@ class AIService:
         ]
 
         for msg in get_history(user_id):
-            if msg["role"] == "user":
-                messages.append(
-                    ChatCompletionUserMessageParam(
-                        role="user",
-                        content=msg["content"],
-                    )
-                )
-            else:
-                messages.append(
-                    ChatCompletionAssistantMessageParam(
-                        role="assistant",
-                        content=msg["content"],
-                    )
-                )
+            role_cls = (
+                ChatCompletionUserMessageParam
+                if msg["role"] == "user"
+                else ChatCompletionAssistantMessageParam
+            )
+            messages.append(role_cls(role=msg["role"], content=msg["content"]))
 
         messages.append(
-            ChatCompletionUserMessageParam(
-                role="user",
-                content=request,
-            )
+            ChatCompletionUserMessageParam(role="user", content=request)
         )
 
         response = await groq_client.chat.completions.create(
             model=model,
             messages=messages,
-            temperature=0.7,
+            temperature=0.75,
         )
 
         result = response.choices[0].message.content or ""
         result = re.sub(r"<think>.*?</think>", "", result, flags=re.DOTALL).strip()
 
         add_message(user_id, "user", request)
-        add_message(user_id, "assistant", result)
+        add_message(user_id, "assistant", f"[Axle] {result}")
 
         return result
 
-    @staticmethod
-    @exponential(3, 3, 20)
-    async def generate_with_gemini(
-        request: str,
-        model: str,
-        system_prompt: str,
-        user_id: int,
-    ) -> str:
+async def generate_text(request, model, prompt, user_id):
+    return await AIService.generate_with_groq(request, model, prompt, user_id)
 
-        history = []
-        for msg in get_history(user_id):
-            role = "user" if msg["role"] == "user" else "model"
-            history.append(
-                types.Content(
-                    role=role,
-                    parts=[types.Part.from_text(msg["content"])],
-                )
-            )
-
-        history.append(
-            types.Content(
-                role="user",
-                parts=[types.Part.from_text(request)],
-            )
-        )
-
-        response = await gemini_client.aio.models.generate_content(
-            model=model,
-            config=types.GenerateContentConfig(
-                system_instruction=system_prompt
-            ),
-            contents=history,
-        )
-
-        result = response.text.strip()
-
-        add_message(user_id, "user", request)
-        add_message(user_id, "assistant", result)
-
-        return result
-
-async def generate_text(
-    request: str,
-    model: str,
-    prompt: str,
-    user_id: int,
-) -> str:
-
-    if any(x in model.lower() for x in ("gemini", "gemma")):
-        return await AIService.generate_with_gemini(
-            request, model, prompt, user_id
-        )
-
-    return await AIService.generate_with_groq(
-        request, model, prompt, user_id
-    )
+async def send_long_message(channel, text: str):
+    text = text.strip()
+    while len(text) > MAX_DISCORD_MESSAGE_LENGTH:
+        split_at = text.rfind("\n", 0, MAX_DISCORD_MESSAGE_LENGTH)
+        split_at = split_at if split_at != -1 else MAX_DISCORD_MESSAGE_LENGTH
+        await channel.send(text[:split_at])
+        text = text[split_at:].lstrip()
+    if text:
+        await channel.send(text)
 
 @bot.listen(hikari.StartedEvent)
 async def on_started(_: hikari.StartedEvent):
@@ -286,23 +186,15 @@ async def on_started(_: hikari.StartedEvent):
 
     channel_id = os.getenv("STARTUP_CHANNEL_ID")
     if channel_id:
-        try:
-            channel = await bot.rest.fetch_channel(int(channel_id))
-            await channel.send("back online")
-        except Exception:
-            logger.exception("Failed to send startup message")
-
-    logger.info("Axle is online.")
+        channel = await bot.rest.fetch_channel(int(channel_id))
+        await channel.send("back online")
 
 @bot.listen(hikari.StoppingEvent)
 async def on_stopping(_: hikari.StoppingEvent):
     channel_id = os.getenv("STARTUP_CHANNEL_ID")
     if channel_id:
-        try:
-            channel = await bot.rest.fetch_channel(int(channel_id))
-            await channel.send("going offline")
-        except Exception:
-            logger.exception("Failed to send offline message")
+        channel = await bot.rest.fetch_channel(int(channel_id))
+        await channel.send("going offline")
 
 @bot.listen(hikari.MessageCreateEvent)
 async def on_message(event: hikari.MessageCreateEvent):
@@ -314,28 +206,30 @@ async def on_message(event: hikari.MessageCreateEvent):
         return
 
     me = event.app.cache.get_me()
-    mentioned = re.search(fr"<@!?{me.id}>", content)
-    replied = (
-        event.message.referenced_message
-        and event.message.referenced_message.author.id == me.id
-    )
-
-    if not (mentioned or replied):
+    if not (re.search(fr"<@!?{me.id}>", content) or
+            (event.message.referenced_message and
+             event.message.referenced_message.author.id == me.id)):
         return
 
-    channel = event.get_channel()
     cleaned = re.sub(fr"<@!?{me.id}>", "", content).strip()
+    channel = event.get_channel()
 
-    # ✅ FIX: define identity before using it
-    identity = get_author_identity(event)
+    context_block = build_context_block(event)
+    prev_topic = conversation_topics.get(event.author.id)
 
-    prompt = DEFAULT_PROMPT.format(
-        channel=channel.name if isinstance(event, hikari.GuildMessageCreateEvent) else "DM",
-        server=event.get_guild().name if isinstance(event, hikari.GuildMessageCreateEvent) else "DMs",
-        username=identity["username"],
-        global_name=identity["global_name"],
-        nickname=identity["nickname"],
-    )
+    prompt = f"""
+{DEFAULT_PROMPT}
+
+{context_block}
+
+PREVIOUS TOPIC:
+{prev_topic if prev_topic else "none"}
+
+Rules:
+- You may reference earlier messages
+- You may call back to jokes or arguments
+- Stay socially aware
+"""
 
     async with bot.rest.trigger_typing(channel):
         try:
@@ -346,15 +240,12 @@ async def on_message(event: hikari.MessageCreateEvent):
                 event.author.id,
             )
 
-            if not response:
-                await channel.send("uhhh i blanked. try again.")
-                return
-
+            conversation_topics[event.author.id] = cleaned[:80]
             await send_long_message(channel, response)
 
         except Exception:
             logger.error(traceback.format_exc())
-            await channel.send("something broke. probably not my fault.")
+            await channel.send("something broke. not my fault.")
 
 async def init_db():
     async with aiosqlite.connect(db_file) as db:
@@ -370,7 +261,6 @@ async def init_db():
 async def record_stats():
     app = await bot.rest.fetch_application()
     today = datetime.date.today().isoformat()
-
     member_count = sum(
         g.member_count or 0
         for g in bot.cache.get_guilds_view().values()
@@ -382,48 +272,6 @@ async def record_stats():
             (today, app.approximate_guild_count, member_count),
         )
         await db.commit()
-
-@bot.listen(hikari.StartedEvent)
-async def on_started(_: hikari.StartedEvent):
-    await init_db()
-    aiocron.crontab("0 0 * * *", func=record_stats)
-
-    await bot.update_presence(
-        status=hikari.Status.ONLINE,
-        activity=hikari.Activity(
-            type=hikari.ActivityType.LISTENING,
-            name="I am Axle!",
-        ),
-    )
-
-    channel_id = os.getenv("STARTUP_CHANNEL_ID")
-    if channel_id:
-        try:
-            channel = await bot.rest.fetch_channel(int(channel_id))
-            msg = await generate_lifecycle_message(
-                "You just came back online"
-            )
-            if msg:
-                await channel.send(msg)
-        except Exception:
-            logger.exception("Failed to send startup message")
-
-    logger.info("Axle is online.")
-
-
-@bot.listen(hikari.StoppingEvent)
-async def on_stopping(_: hikari.StoppingEvent):
-    channel_id = os.getenv("STARTUP_CHANNEL_ID")
-    if channel_id:
-        try:
-            channel = await bot.rest.fetch_channel(int(channel_id))
-            msg = await generate_lifecycle_message(
-                "You are about to go offline"
-            )
-            if msg:
-                await channel.send(msg)
-        except Exception:
-            logger.exception("Failed to send offline message")
 
 @client.register()
 class Ping(lightbulb.SlashCommand, name="ping", description="Check latency"):
