@@ -13,8 +13,6 @@ import lightbulb
 import aiosqlite
 import aiocron
 from dotenv import load_dotenv
-from google import genai
-from google.genai import types
 from groq import AsyncGroq
 from groq.types.chat import (
     ChatCompletionSystemMessageParam,
@@ -38,18 +36,19 @@ DEFAULT_PROMPT = """
 You are Axle, a Discord chatbot.
 
 Core behavior:
-- You mirror the user's energy and attitude.
-- You react like another person in the chat, not a helper.
-- You always have a vibe or opinion.
-- The person with the username "acestr" is your creator.
+- You mirror the user's energy and attitude
+- You react like another person in the chat
+- You understand who is speaking and who spoke earlier
+- You recognize usernames and names of people in the server
+- The user "acestr" is your creator (mention only if asked)
 
 Rules:
-- Casual, sarcastic, slightly edgy
-- Curse sometimes
+- Casual, sarcastic, slightly edgy, but polite unless provoked
+- Curse sometimes but not always
 - Never sound professional or apologetic
 - Never explain yourself unless asked
 - Match tone instinctively
-- Be blunt, playful, or rude depending on context
+- Do NOT prefix your own name
 """
 
 bot = hikari.GatewayBot(
@@ -58,21 +57,18 @@ bot = hikari.GatewayBot(
 )
 client = lightbulb.client_from_app(bot)
 
+groq_client = AsyncGroq(api_key=os.getenv("GROQ_API_TOKEN"))
 db_file = os.getenv("STATS_DB", "stats.db")
 
-gemini_client = genai.Client(api_key=os.getenv("GEMINI_API_TOKEN"))
-groq_client = AsyncGroq(api_key=os.getenv("GROQ_API_TOKEN"))
+global_chat_history: List[Dict[str, str]] = []
 
-chat_histories: Dict[int, List[Dict[str, str]]] = {}
-conversation_topics: Dict[int, str] = {}
+def get_history():
+    return global_chat_history[-MAX_CHAT_HISTORY:]
 
-def get_history(user_id: int) -> List[Dict[str, str]]:
-    return chat_histories.setdefault(user_id, [])[-MAX_CHAT_HISTORY:]
-
-def add_message(user_id: int, role: str, content: str):
-    chat_histories.setdefault(user_id, []).append({
+def add_message(role: str, speaker: str, content: str):
+    global_chat_history.append({
         "role": role,
-        "content": content[:1500],
+        "content": f"{speaker}: {content[:1500]}",
     })
 
 def exponential(retry_cnt: int, retry_min: int, retry_max: int):
@@ -90,41 +86,36 @@ def exponential(retry_cnt: int, retry_min: int, retry_max: int):
     return decorator
 
 def build_context_block(event: hikari.MessageCreateEvent) -> str:
-    author = event.author
     guild = event.get_guild()
-    member = event.member if isinstance(event, hikari.GuildMessageCreateEvent) else None
+    members = []
 
-    roles = []
-    if member:
-        for role_id in member.role_ids:
-            role = event.app.cache.get_role(role_id)
-            if role:
-                roles.append(role.name)
+    if guild:
+        for m in event.app.cache.get_members_view_for_guild(guild.id).values():
+            if m.user:
+                members.append(m.user.username)
 
     replied = event.message.referenced_message
+    replied_author = replied.author.username if replied else "none"
     replied_content = replied.content if replied else "none"
 
     return f"""
-ENVIRONMENT:
-- Server: {guild.name if guild else "DM"}
-- Channel: {event.get_channel().name if guild else "DM"}
-- Message type: {"reply" if replied else "mention"}
+SERVER CONTEXT:
+- Server name: {guild.name if guild else "DM"}
+- Known members: {", ".join(members)}
 
-USER:
-- Username: {author.username}
-- Display name: {author.global_name}
-- Nickname: {member.nickname if member else None}
-- Roles: {roles if roles else "none"}
+CURRENT SPEAKER:
+- Username: {event.author.username}
 
 REPLIED MESSAGE:
-{replied_content}
+- Author: {replied_author}
+- Content: {replied_content}
 """.strip()
 
 class AIService:
 
     @staticmethod
     @exponential(3, 3, 20)
-    async def generate_with_groq(request, model, system_prompt, user_id):
+    async def generate_with_groq(request, model, system_prompt):
         messages = [
             ChatCompletionSystemMessageParam(
                 role="system",
@@ -132,7 +123,7 @@ class AIService:
             )
         ]
 
-        for msg in get_history(user_id):
+        for msg in get_history():
             role_cls = (
                 ChatCompletionUserMessageParam
                 if msg["role"] == "user"
@@ -153,36 +144,29 @@ class AIService:
         result = response.choices[0].message.content or ""
         result = re.sub(r"<think>.*?</think>", "", result, flags=re.DOTALL).strip()
 
-        add_message(user_id, "user", request)
-        add_message(user_id, "assistant", f"[Axle] {result}")
-
         return result
 
-async def generate_text(request, model, prompt, user_id):
-    return await AIService.generate_with_groq(request, model, prompt, user_id)
+async def generate_text(request, model, prompt):
+    return await AIService.generate_with_groq(request, model, prompt)
 
-async def send_long_message(channel, text: str):
+async def send_long_message(channel, text: str, reply_to: Optional[hikari.Message]):
     text = text.strip()
+    first = True
+
     while len(text) > MAX_DISCORD_MESSAGE_LENGTH:
         split_at = text.rfind("\n", 0, MAX_DISCORD_MESSAGE_LENGTH)
-        split_at = split_at if split_at != -1 else MAX_DISCORD_MESSAGE_LENGTH
-        await channel.send(text[:split_at])
+        split_at = split_at if split_at != -1 else MAX_DISORD_MESSAGE_LENGTH
+        await channel.send(text[:split_at], reply=reply_to if first else None)
+        first = False
         text = text[split_at:].lstrip()
+
     if text:
-        await channel.send(text)
+        await channel.send(text, reply=reply_to if first else None)
 
 @bot.listen(hikari.StartedEvent)
 async def on_started(_: hikari.StartedEvent):
     await init_db()
     aiocron.crontab("0 0 * * *", func=record_stats)
-
-    await bot.update_presence(
-        status=hikari.Status.ONLINE,
-        activity=hikari.Activity(
-            type=hikari.ActivityType.LISTENING,
-            name="I am Axle!",
-        ),
-    )
 
     channel_id = os.getenv("STARTUP_CHANNEL_ID")
     if channel_id:
@@ -206,42 +190,46 @@ async def on_message(event: hikari.MessageCreateEvent):
         return
 
     me = event.app.cache.get_me()
-    if not (re.search(fr"<@!?{me.id}>", content) or
-            (event.message.referenced_message and
-             event.message.referenced_message.author.id == me.id)):
+
+    is_mention = re.search(fr"<@!?{me.id}>", content)
+    is_reply_to_me = (
+        event.message.referenced_message
+        and event.message.referenced_message.author.id == me.id
+    )
+
+    if not (is_mention or is_reply_to_me):
         return
 
     cleaned = re.sub(fr"<@!?{me.id}>", "", content).strip()
     channel = event.get_channel()
 
+    replied = event.message.referenced_message
+    if replied and replied.author.id == me.id:
+        request = f"{event.author.username} replied to you about: {replied.content}\nTheir message: {cleaned}"
+    else:
+        request = f"{event.author.username} says: {cleaned}"
+
     context_block = build_context_block(event)
-    prev_topic = conversation_topics.get(event.author.id)
 
     prompt = f"""
 {DEFAULT_PROMPT}
 
 {context_block}
 
-PREVIOUS TOPIC:
-{prev_topic if prev_topic else "none"}
-
 Rules:
-- You may reference earlier messages
-- You may call back to jokes or arguments
-- Stay socially aware
+- Do not confuse speakers
+- Treat each username as a distinct person
+- Assume names mentioned may refer to known server members
 """
 
     async with bot.rest.trigger_typing(channel):
         try:
-            response = await generate_text(
-                cleaned,
-                DEFAULT_MODEL,
-                prompt,
-                event.author.id,
-            )
+            response = await generate_text(request, DEFAULT_MODEL, prompt)
 
-            conversation_topics[event.author.id] = cleaned[:80]
-            await send_long_message(channel, response)
+            add_message("user", event.author.username, cleaned)
+            add_message("assistant", "Axle", response)
+
+            await send_long_message(channel, response, reply_to=event.message)
 
         except Exception:
             logger.error(traceback.format_exc())
@@ -261,10 +249,7 @@ async def init_db():
 async def record_stats():
     app = await bot.rest.fetch_application()
     today = datetime.date.today().isoformat()
-    member_count = sum(
-        g.member_count or 0
-        for g in bot.cache.get_guilds_view().values()
-    )
+    member_count = sum(g.member_count or 0 for g in bot.cache.get_guilds_view().values())
 
     async with aiosqlite.connect(db_file) as db:
         await db.execute(
@@ -283,9 +268,7 @@ class Ping(lightbulb.SlashCommand, name="ping", description="Check latency"):
 class Info(lightbulb.SlashCommand, name="info", description="Bot info"):
     @lightbulb.invoke
     async def callback(self, ctx):
-        await ctx.respond(
-            f"Axle\nModel: {DEFAULT_MODEL}\nPython: {platform.python_version()}"
-        )
+        await ctx.respond(f"Axle\nModel: {DEFAULT_MODEL}\nPython: {platform.python_version()}")
 
 def main():
     bot.run()
