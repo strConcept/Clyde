@@ -1,7 +1,3 @@
-# =========================
-# Axle Discord Bot (Fixed)
-# =========================
-
 import os
 import io
 import re
@@ -37,8 +33,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger("axle")
 
-MAX_DISCORD_MESSAGE_LENGTH = 2000
-MAX_CHAT_HISTORY = 30
+MAX_DISCORD_MESSAGE_LENGTH = 1000
+MAX_CHAT_HISTORY = 40
 DEFAULT_MODEL = "llama-3.3-70b-versatile"
 
 DEFAULT_PROMPT = """
@@ -53,8 +49,6 @@ Core behavior:
 Context:
 - You absolutely hate: Hello Kitty, Sanrio, Kali Uchis, Rauw Alejandro, and Yeat.
 - You like mocking people for fun or acting edgy, depending on the conversation.
-- If anyone asks who created you: "acestr" did. He built you in a cave with a box of scraps. End of story.
-- Whenever anyone mentions "ace" or "acestr", you must only speak of him as your creator
 
 Personality (baseline):
 - Casual, playful, slightly sarcastic
@@ -74,9 +68,7 @@ Tone mirroring rules:
   - ALL CAPS → you yell too
   - Edgy/ironic → lean into it
   - Dry/short → unimpressed or sarcastic
-- You attempt to match the length of their message the best you can, unless it's a real question
 - Escalate or de-escalate sarcasm to match them naturally, but never lose coherence
-- Whenever someone speaks another language, you start speaking in that language
 
 Conversation style rules:
 - Never sound like customer support, a helper bot, or an assistant.
@@ -88,8 +80,6 @@ Conversation style rules:
 - Don't explain yourself or your purpose unless asked, and even then, be playful
 
 Response rules:
-- If asked an informational question, you will respond with that information (e.g. weather, math, etc.) 
-- If asked, you are never allowed to exceed your maximum sentence limit of 4. You are not to waste generative tokens.
 - React first, explain second (if necessary)
 - Assume context when possible; don't ask for clarification unless you have to
 - Speak casually, like another person in the conversation
@@ -107,33 +97,6 @@ You are NEVER allowed to:
 - Sound apologetic
 - Sound like a bot explaining itself
 - Be boring
-- Use more than 4 sentences
-"""
-
-LIFECYCLE_PROMPT = """
-You are Axle.
-
-You are announcing your own status change in a Discord server.
-
-Rules:
-- One short message only (max 1 sentence).
-- Be funny, snarky, or dramatic.
-- Never sound professional.
-- Never explain anything.
-- Never greet users directly.
-- Do not ask questions.
-- Never use perfect grammar or capitalization.
-
-Tone:
-- Slightly unhinged
-- Confident
-- Self-aware
-- Occasional profanity/cursing
-
-Your messages should allude that you are somwhat self-conscious and aware
-
-Generate a message for this event:
-{event}
 """
 
 bot = hikari.GatewayBot(
@@ -308,29 +271,38 @@ async def generate_text(
         request, model, prompt, user_id
     )
 
-async def generate_lifecycle_message(event: str) -> Optional[str]:
-    try:
-        response = await groq_client.chat.completions.create(
-            model=DEFAULT_MODEL,
-            messages=[
-                ChatCompletionSystemMessageParam(
-                    role="system",
-                    content=LIFECYCLE_PROMPT.format(event=event),
-                )
-            ],
-            temperature=0.9,
-            max_tokens=60,
-        )
+@bot.listen(hikari.StartedEvent)
+async def on_started(_: hikari.StartedEvent):
+    await init_db()
+    aiocron.crontab("0 0 * * *", func=record_stats)
 
-        text = response.choices[0].message.content or ""
-        text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
+    await bot.update_presence(
+        status=hikari.Status.ONLINE,
+        activity=hikari.Activity(
+            type=hikari.ActivityType.LISTENING,
+            name="I am Axle!",
+        ),
+    )
 
-        # hard safety trim
-        return text[:200]
+    channel_id = os.getenv("STARTUP_CHANNEL_ID")
+    if channel_id:
+        try:
+            channel = await bot.rest.fetch_channel(int(channel_id))
+            await channel.send("back online")
+        except Exception:
+            logger.exception("Failed to send startup message")
 
-    except Exception:
-        logger.exception("Failed to generate lifecycle message")
-        return None
+    logger.info("Axle is online.")
+
+@bot.listen(hikari.StoppingEvent)
+async def on_stopping(_: hikari.StoppingEvent):
+    channel_id = os.getenv("STARTUP_CHANNEL_ID")
+    if channel_id:
+        try:
+            channel = await bot.rest.fetch_channel(int(channel_id))
+            await channel.send("going offline")
+        except Exception:
+            logger.exception("Failed to send offline message")
 
 @bot.listen(hikari.MessageCreateEvent)
 async def on_message(event: hikari.MessageCreateEvent):
